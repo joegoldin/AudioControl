@@ -144,18 +144,18 @@ class _PeakMonitor:
                 linear_peak = max(abs(s) for s in samples) / 32768.0
 
                 # Convert to logarithmic scale (dB-like) for perceptual VU
-                # -60dB floor, 0dB = 1.0 linear
-                if linear_peak > 0.001:
+                # -40dB floor, 0dB = 1.0 linear
+                if linear_peak > 0.01:
                     db = 20.0 * math.log10(linear_peak)
-                    current_peak = max(0.0, min(1.0, (db + 60.0) / 60.0))
+                    current_peak = max(0.0, min(1.0, (db + 40.0) / 40.0))
                 else:
                     current_peak = 0.0
 
-                # Fast attack, slow decay
+                # Fast attack, faster decay
                 if current_peak > decay:
                     decay = current_peak
                 else:
-                    decay = decay * 0.85 + current_peak * 0.15
+                    decay = decay * 0.7 + current_peak * 0.3
 
                 with self._lock:
                     self._peak = decay
@@ -175,8 +175,6 @@ class _PeakMonitor:
 class AdjustVolume(AudioCore):
     # Ticks before +/- icon reverts to plain speaker (~1s/tick)
     SCROLL_ICON_TICKS = 2
-    # Refresh display every N ticks
-    VU_REFRESH_INTERVAL = 1
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -192,7 +190,6 @@ class AdjustVolume(AudioCore):
         self._is_muted = False
         self._cached_volume = 0.0  # 0.0 - 1.0+
         self._lock = threading.Lock()
-        self._vu_tick_counter = 0
 
         self._peak_monitor = _PeakMonitor(on_update=self.display_icon)
 
@@ -344,22 +341,15 @@ class AdjustVolume(AudioCore):
 
     def on_tick(self):
         super().on_tick()
-        icon_changed = False
         with self._lock:
             if self._scroll_ticks_remaining > 0:
                 self._scroll_ticks_remaining -= 1
                 if self._scroll_ticks_remaining == 0:
                     self._scroll_direction = None
-                    icon_changed = True
 
-        # Throttled periodic refresh (~2x/sec)
-        self._vu_tick_counter += 1
-        if self._vu_tick_counter >= self.VU_REFRESH_INTERVAL:
-            self._vu_tick_counter = 0
-            self._refresh_cached_volume()
-            self._update_display()
-        elif icon_changed:
-            self.display_icon()
+        # Refresh cached volume for the horizontal bar (~1Hz)
+        # Display is driven by the peak monitor thread at ~5Hz
+        self._refresh_cached_volume()
 
     def on_volume_adjust_change(self, widget, value, old):
         self.adjust = value
