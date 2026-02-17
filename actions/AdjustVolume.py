@@ -370,12 +370,14 @@ class AdjustVolume(AudioCore):
             icon_asset = self.get_icon(Icons.VOLUME_UP)
         elif direction == "down":
             icon_asset = self.get_icon(Icons.VOLUME_DOWN)
-        elif self._cached_volume > 0.66:
+        elif self._cached_volume > 0.75:
             icon_asset = self.get_icon(Icons.AUDIO_HIGH)
-        elif self._cached_volume > 0.33:
+        elif self._cached_volume > 0.50:
             icon_asset = self.get_icon(Icons.AUDIO_MEDIUM)
-        else:
+        elif self._cached_volume > 0.25:
             icon_asset = self.get_icon(Icons.AUDIO_LOW)
+        else:
+            icon_asset = self.get_icon(Icons.UNMUTED)
 
         if not icon_asset:
             return
