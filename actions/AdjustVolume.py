@@ -1,5 +1,4 @@
 import ctypes
-import math
 import struct
 import threading
 
@@ -27,6 +26,9 @@ class _PeakMonitor:
             ('rate', ctypes.c_uint32),
             ('channels', ctypes.c_uint8),
         ]
+
+    # Moving average window size (in reads, ~50ms each → 40 = ~2s)
+    AVG_WINDOW = 40
 
     def __init__(self):
         self._lib = None
@@ -126,7 +128,8 @@ class _PeakMonitor:
         # 50ms buffer at 8kHz mono s16le = 800 bytes (400 samples)
         buf_size = 800
         buf = ctypes.create_string_buffer(buf_size)
-        decay = 0.0
+        ring = [0.0] * self.AVG_WINDOW
+        ring_idx = 0
 
         try:
             while self._running:
@@ -138,22 +141,17 @@ class _PeakMonitor:
                 samples = struct.unpack(f'<{num_samples}h', buf.raw)
                 linear_peak = max(abs(s) for s in samples) / 32768.0
 
-                # Convert to logarithmic scale (dB-like) for perceptual VU
-                # -40dB floor, 0dB = 1.0 linear
-                if linear_peak > 0.01:
-                    db = 20.0 * math.log10(linear_peak)
-                    current_peak = max(0.0, min(1.0, (db + 40.0) / 40.0))
-                else:
-                    current_peak = 0.0
+                # Power curve compression: makes low levels visible
+                # 0.01 → 0.16, 0.1 → 0.40, 0.5 → 0.70, 1.0 → 1.0
+                current_peak = min(1.0, linear_peak ** 0.2)
 
-                # Fast attack, faster decay
-                if current_peak > decay:
-                    decay = current_peak
-                else:
-                    decay = decay * 0.7 + current_peak * 0.3
+                # Moving average over last N samples for smooth VU
+                ring[ring_idx] = current_peak
+                ring_idx = (ring_idx + 1) % self.AVG_WINDOW
+                avg = sum(ring) / self.AVG_WINDOW
 
                 with self._lock:
-                    self._peak = decay
+                    self._peak = avg
         finally:
             self._lib.pa_simple_free(conn)
 
@@ -335,8 +333,6 @@ class AdjustVolume(AudioCore):
                     self._scroll_direction = None
 
         # Refresh cached volume and update display each tick
-        # Peak monitor thread continuously updates peak value in background;
-        # we just read the latest value here when the hardware actually refreshes
         self._refresh_cached_volume()
         self._update_display()
 
@@ -417,9 +413,9 @@ class AdjustVolume(AudioCore):
         scaled = icon_image.resize((icon_w, icon_h), Image.LANCZOS)
 
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        # Center icon within the area left of VU and above vol bar
-        ix = (icon_area_right - icon_w) // 2
-        iy = (icon_area_bottom - icon_h) // 2
+        # Center icon within the area left of VU and above vol bar, nudged in
+        ix = (icon_area_right - icon_w) // 2 + pad
+        iy = (icon_area_bottom - icon_h) // 2 + pad
         img.paste(scaled, (ix, iy), scaled)
 
         del draw
