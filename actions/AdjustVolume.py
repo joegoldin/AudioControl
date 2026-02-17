@@ -1,4 +1,5 @@
 import ctypes
+import math
 import struct
 import threading
 
@@ -35,7 +36,7 @@ class _PeakMonitor:
         self._running = False
 
         try:
-            self._lib = ctypes.CDLL('libpulse-simple.so.0')
+            self._lib = ctypes.CDLL(self._find_lib())
             self._lib.pa_simple_new.restype = ctypes.c_void_p
             self._lib.pa_simple_read.restype = ctypes.c_int
             self._lib.pa_simple_read.argtypes = [
@@ -44,8 +45,34 @@ class _PeakMonitor:
             ]
             self._lib.pa_simple_free.restype = None
             self._lib.pa_simple_free.argtypes = [ctypes.c_void_p]
-        except OSError:
+        except (OSError, TypeError):
             self._lib = None
+
+    @staticmethod
+    def _find_lib():
+        """Find libpulse-simple.so.0, deriving path from loaded libpulse if needed."""
+        import os
+        # Try standard name first
+        name = 'libpulse-simple.so.0'
+        try:
+            ctypes.CDLL(name)
+            return name
+        except OSError:
+            pass
+        # Derive from libpulse.so already loaded by pulsectl (works on NixOS)
+        try:
+            pid = os.getpid()
+            with open(f'/proc/{pid}/maps', 'r') as f:
+                for line in f:
+                    if 'libpulse.so' in line and 'libpulsecommon' not in line:
+                        path = line.strip().split()[-1]
+                        lib_dir = os.path.dirname(path)
+                        candidate = os.path.join(lib_dir, name)
+                        if os.path.exists(candidate):
+                            return candidate
+        except Exception:
+            pass
+        return None
 
     @property
     def available(self):
@@ -109,7 +136,15 @@ class _PeakMonitor:
 
                 num_samples = buf_size // 2
                 samples = struct.unpack(f'<{num_samples}h', buf.raw)
-                current_peak = max(abs(s) for s in samples) / 32768.0
+                linear_peak = max(abs(s) for s in samples) / 32768.0
+
+                # Convert to logarithmic scale (dB-like) for perceptual VU
+                # -60dB floor, 0dB = 1.0 linear
+                if linear_peak > 0.001:
+                    db = 20.0 * math.log10(linear_peak)
+                    current_peak = max(0.0, min(1.0, (db + 60.0) / 60.0))
+                else:
+                    current_peak = 0.0
 
                 # Fast attack, slow decay
                 if current_peak > decay:
@@ -124,15 +159,16 @@ class _PeakMonitor:
 
 
 class AdjustVolume(AudioCore):
-    # Ticks before +/- icon reverts to plain speaker
-    SCROLL_ICON_TICKS = 10
-    # Refresh display every N ticks (~100ms each → 5 = ~2x/sec)
-    VU_REFRESH_INTERVAL = 5
+    # Ticks before +/- icon reverts to plain speaker (~1s/tick)
+    SCROLL_ICON_TICKS = 2
+    # Refresh display every N ticks
+    VU_REFRESH_INTERVAL = 1
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.icon_keys = [Icons.VOLUME_UP, Icons.VOLUME_DOWN, Icons.MUTED, Icons.UNMUTED]
+        self.icon_keys = [Icons.VOLUME_UP, Icons.VOLUME_DOWN, Icons.MUTED, Icons.UNMUTED,
+                          Icons.AUDIO_LOW, Icons.AUDIO_MEDIUM, Icons.AUDIO_HIGH]
 
         self.adjust: int = 1
         self.bounds = 100
@@ -338,16 +374,19 @@ class AdjustVolume(AudioCore):
         with self._lock:
             direction = self._scroll_direction
 
-        # Pick icon: muted > scroll direction > idle (plain speaker)
+        # Pick icon: muted > scroll direction > idle (volume-based waves)
         if self._is_muted:
             icon_asset = self.get_icon(Icons.MUTED)
         elif direction == "up":
             icon_asset = self.get_icon(Icons.VOLUME_UP)
         elif direction == "down":
             icon_asset = self.get_icon(Icons.VOLUME_DOWN)
+        elif self._cached_volume > 0.66:
+            icon_asset = self.get_icon(Icons.AUDIO_HIGH)
+        elif self._cached_volume > 0.33:
+            icon_asset = self.get_icon(Icons.AUDIO_MEDIUM)
         else:
-            # Idle: plain speaker icon
-            icon_asset = self.get_icon(Icons.UNMUTED)
+            icon_asset = self.get_icon(Icons.AUDIO_LOW)
 
         if not icon_asset:
             return
@@ -412,8 +451,8 @@ class AdjustVolume(AudioCore):
         # --- Vertical VU bar on the right (shows actual audio output level) ---
         vu_bar_width = max(4, w // 16)
         vu_x = w - pad - vu_bar_width
-        vu_top = pad
         vu_bottom = bar_y - pad
+        vu_top = vu_bottom - (vu_bottom - pad) * 2 // 3  # ~2/3 height
         vu_height = vu_bottom - vu_top
 
         # Track background
