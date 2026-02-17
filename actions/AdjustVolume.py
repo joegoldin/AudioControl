@@ -164,7 +164,8 @@ class AdjustVolume(AudioCore):
         super().__init__(*args, **kwargs)
 
         self.icon_keys = [Icons.VOLUME_UP, Icons.VOLUME_DOWN, Icons.MUTED, Icons.UNMUTED,
-                          Icons.AUDIO_LOW, Icons.AUDIO_MEDIUM, Icons.AUDIO_HIGH]
+                          Icons.AUDIO_OFF, Icons.AUDIO_LOW, Icons.AUDIO_MEDIUM_LOW,
+                          Icons.AUDIO_MEDIUM, Icons.AUDIO_HIGH, Icons.AUDIO_MAX]
 
         self.adjust: int = 1
         self.bounds = 100
@@ -370,14 +371,18 @@ class AdjustVolume(AudioCore):
             icon_asset = self.get_icon(Icons.VOLUME_UP)
         elif direction == "down":
             icon_asset = self.get_icon(Icons.VOLUME_DOWN)
-        elif self._cached_volume > 0.75:
+        elif self._cached_volume > 0.83:
+            icon_asset = self.get_icon(Icons.AUDIO_MAX)
+        elif self._cached_volume > 0.67:
             icon_asset = self.get_icon(Icons.AUDIO_HIGH)
         elif self._cached_volume > 0.50:
             icon_asset = self.get_icon(Icons.AUDIO_MEDIUM)
-        elif self._cached_volume > 0.25:
+        elif self._cached_volume > 0.33:
+            icon_asset = self.get_icon(Icons.AUDIO_MEDIUM_LOW)
+        elif self._cached_volume > 0.17:
             icon_asset = self.get_icon(Icons.AUDIO_LOW)
         else:
-            icon_asset = self.get_icon(Icons.UNMUTED)
+            icon_asset = self.get_icon(Icons.AUDIO_OFF)
 
         if not icon_asset:
             icon_asset = self.get_icon(Icons.UNMUTED)
@@ -417,9 +422,9 @@ class AdjustVolume(AudioCore):
         scaled = icon_image.resize((icon_w, icon_h), Image.LANCZOS)
 
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        # Center icon within the area left of VU and above vol bar, nudged in
+        # Center icon within the area left of VU and above vol bar, nudged down
         ix = (icon_area_right - icon_w) // 2 + pad
-        iy = (icon_area_bottom - icon_h) // 2 + pad
+        iy = (icon_area_bottom - icon_h) // 2 + pad * 2
         img.paste(scaled, (ix, iy), scaled)
 
         del draw

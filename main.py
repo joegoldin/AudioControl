@@ -151,9 +151,12 @@ class AudioControl(PluginBase):
         self.add_icon(Icons.UNMUTED, self.get_asset_path("audio.png"), size)
         self.add_icon(Icons.VOLUME_DOWN, self.get_asset_path("volume_down.png"), size)
         self.add_icon(Icons.VOLUME_UP, self.get_asset_path("volume_up.png"), size)
+        self.add_icon(Icons.AUDIO_OFF, self.get_asset_path("audio_off.png"), size)
         self.add_icon(Icons.AUDIO_LOW, self.get_asset_path("audio_low.png"), size)
+        self.add_icon(Icons.AUDIO_MEDIUM_LOW, self.get_asset_path("audio_medium_low.png"), size)
         self.add_icon(Icons.AUDIO_MEDIUM, self.get_asset_path("audio_medium.png"), size)
         self.add_icon(Icons.AUDIO_HIGH, self.get_asset_path("audio_high.png"), size)
+        self.add_icon(Icons.AUDIO_MAX, self.get_asset_path("audio_max.png"), size)
 
         self.add_icon(Icons.SPEAKER_DEFAULT, self.get_asset_path("speaker_default.png"))
         self.add_icon(Icons.HEADPHONE_DEFAULT, self.get_asset_path("headphone_default.png"))
