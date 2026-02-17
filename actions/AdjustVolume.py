@@ -28,16 +28,12 @@ class _PeakMonitor:
             ('channels', ctypes.c_uint8),
         ]
 
-    # Call on_update every N reads (~50ms each → 4 = ~200ms = 5Hz)
-    UPDATE_EVERY = 4
-
-    def __init__(self, on_update=None):
+    def __init__(self):
         self._lib = None
         self._peak = 0.0
         self._lock = threading.Lock()
         self._thread = None
         self._running = False
-        self._on_update = on_update
 
         try:
             self._lib = ctypes.CDLL(self._find_lib())
@@ -131,7 +127,6 @@ class _PeakMonitor:
         buf_size = 800
         buf = ctypes.create_string_buffer(buf_size)
         decay = 0.0
-        read_count = 0
 
         try:
             while self._running:
@@ -159,15 +154,6 @@ class _PeakMonitor:
 
                 with self._lock:
                     self._peak = decay
-
-                # Drive display updates at ~5Hz
-                read_count += 1
-                if self._on_update and read_count >= self.UPDATE_EVERY:
-                    read_count = 0
-                    try:
-                        self._on_update()
-                    except Exception:
-                        pass
         finally:
             self._lib.pa_simple_free(conn)
 
@@ -191,7 +177,7 @@ class AdjustVolume(AudioCore):
         self._cached_volume = 0.0  # 0.0 - 1.0+
         self._lock = threading.Lock()
 
-        self._peak_monitor = _PeakMonitor(on_update=self.display_icon)
+        self._peak_monitor = _PeakMonitor()
 
         self.create_generative_ui()
 
@@ -257,6 +243,7 @@ class AdjustVolume(AudioCore):
         ))
 
     def on_update(self):
+        self._refresh_cached_volume()
         super().on_update()
         self._start_peak_monitor()
 
@@ -347,9 +334,11 @@ class AdjustVolume(AudioCore):
                 if self._scroll_ticks_remaining == 0:
                     self._scroll_direction = None
 
-        # Refresh cached volume for the horizontal bar (~1Hz)
-        # Display is driven by the peak monitor thread at ~5Hz
+        # Refresh cached volume and update display each tick
+        # Peak monitor thread continuously updates peak value in background;
+        # we just read the latest value here when the hardware actually refreshes
         self._refresh_cached_volume()
+        self._update_display()
 
     def on_volume_adjust_change(self, widget, value, old):
         self.adjust = value
