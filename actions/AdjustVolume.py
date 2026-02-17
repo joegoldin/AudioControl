@@ -380,6 +380,8 @@ class AdjustVolume(AudioCore):
             icon_asset = self.get_icon(Icons.UNMUTED)
 
         if not icon_asset:
+            icon_asset = self.get_icon(Icons.UNMUTED)
+        if not icon_asset:
             return
 
         _, rendered = icon_asset.get_values()
