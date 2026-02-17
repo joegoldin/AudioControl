@@ -189,7 +189,7 @@ class AudioCore(ActionCore):
             self.loaded_devices = []
 
             for device in device_list:
-                if device.description.__contains__("Monitor"):
+                if device.name.endswith(".monitor"):
                     continue
 
                 device_name = filter_proplist(device.proplist)
