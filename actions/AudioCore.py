@@ -195,6 +195,9 @@ class AudioCore(ActionCore):
                 device_name = filter_proplist(device.proplist)
 
                 if device_name is None:
+                    device_name = getattr(device, "description", None)
+
+                if device_name is None:
                     continue
 
                 self.loaded_devices.append(Device(
