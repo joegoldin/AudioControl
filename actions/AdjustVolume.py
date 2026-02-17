@@ -1,3 +1,5 @@
+import ctypes
+import struct
 import threading
 
 from loguru import logger as log
@@ -12,10 +14,119 @@ from ..globals import Icons
 from ..internal.PulseHelpers import get_device, change_volume, get_volumes_from_device, set_volume, mute
 
 
+class _PeakMonitor:
+    """Background thread reading peak audio level from a sink's monitor source."""
+
+    PA_STREAM_RECORD = 2
+    PA_SAMPLE_S16LE = 3
+
+    class _SampleSpec(ctypes.Structure):
+        _fields_ = [
+            ('format', ctypes.c_int),
+            ('rate', ctypes.c_uint32),
+            ('channels', ctypes.c_uint8),
+        ]
+
+    def __init__(self):
+        self._lib = None
+        self._peak = 0.0
+        self._lock = threading.Lock()
+        self._thread = None
+        self._running = False
+
+        try:
+            self._lib = ctypes.CDLL('libpulse-simple.so.0')
+            self._lib.pa_simple_new.restype = ctypes.c_void_p
+            self._lib.pa_simple_read.restype = ctypes.c_int
+            self._lib.pa_simple_read.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_int)
+            ]
+            self._lib.pa_simple_free.restype = None
+            self._lib.pa_simple_free.argtypes = [ctypes.c_void_p]
+        except OSError:
+            self._lib = None
+
+    @property
+    def available(self):
+        return self._lib is not None
+
+    @property
+    def peak(self):
+        with self._lock:
+            return self._peak
+
+    def start(self, sink_name):
+        self.stop()
+        if not self._lib or not sink_name:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._monitor_loop,
+            args=(sink_name,),
+            daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+        with self._lock:
+            self._peak = 0.0
+
+    def _monitor_loop(self, sink_name):
+        monitor = (sink_name + '.monitor').encode()
+        ss = self._SampleSpec(format=self.PA_SAMPLE_S16LE, rate=8000, channels=1)
+        error = ctypes.c_int(0)
+
+        conn = self._lib.pa_simple_new(
+            None,
+            b'streamcontroller-vu',
+            self.PA_STREAM_RECORD,
+            monitor,
+            b'VU Meter',
+            ctypes.byref(ss),
+            None,
+            None,
+            ctypes.byref(error)
+        )
+
+        if not conn:
+            return
+
+        # 50ms buffer at 8kHz mono s16le = 800 bytes (400 samples)
+        buf_size = 800
+        buf = ctypes.create_string_buffer(buf_size)
+        decay = 0.0
+
+        try:
+            while self._running:
+                ret = self._lib.pa_simple_read(conn, buf, buf_size, ctypes.byref(error))
+                if ret < 0:
+                    break
+
+                num_samples = buf_size // 2
+                samples = struct.unpack(f'<{num_samples}h', buf.raw)
+                current_peak = max(abs(s) for s in samples) / 32768.0
+
+                # Fast attack, slow decay
+                if current_peak > decay:
+                    decay = current_peak
+                else:
+                    decay = decay * 0.85 + current_peak * 0.15
+
+                with self._lock:
+                    self._peak = decay
+        finally:
+            self._lib.pa_simple_free(conn)
+
+
 class AdjustVolume(AudioCore):
     # Ticks before +/- icon reverts to plain speaker
-    SCROLL_ICON_TICKS = 15
-    # Refresh VU bars every N ticks (~100ms each → 5 = ~2x/sec)
+    SCROLL_ICON_TICKS = 10
+    # Refresh display every N ticks (~100ms each → 5 = ~2x/sec)
     VU_REFRESH_INTERVAL = 5
 
     def __init__(self, *args, **kwargs):
@@ -32,6 +143,8 @@ class AdjustVolume(AudioCore):
         self._cached_volume = 0.0  # 0.0 - 1.0+
         self._lock = threading.Lock()
         self._vu_tick_counter = 0
+
+        self._peak_monitor = _PeakMonitor()
 
         self.create_generative_ui()
 
@@ -95,6 +208,18 @@ class AdjustVolume(AudioCore):
             default_event=Input.Dial.Events.SHORT_UP,
             callback=self.event_toggle_mute
         ))
+
+    def on_update(self):
+        super().on_update()
+        self._start_peak_monitor()
+
+    def device_changed(self, widget, value, old):
+        super().device_changed(widget, value, old)
+        self._start_peak_monitor()
+
+    def _start_peak_monitor(self):
+        if self.selected_device is not None:
+            self._peak_monitor.start(self.selected_device.pulse_name)
 
     def event_adjust_volume_positive(self, event):
         with self._lock:
@@ -177,7 +302,7 @@ class AdjustVolume(AudioCore):
                     self._scroll_direction = None
                     icon_changed = True
 
-        # Throttled periodic VU refresh (~2x/sec)
+        # Throttled periodic refresh (~2x/sec)
         self._vu_tick_counter += 1
         if self._vu_tick_counter >= self.VU_REFRESH_INTERVAL:
             self._vu_tick_counter = 0
@@ -231,31 +356,44 @@ class AdjustVolume(AudioCore):
         if not rendered:
             return
 
-        composite = self._render_overlays(rendered, self._cached_volume)
+        peak = self._peak_monitor.peak if self._peak_monitor.available else 0.0
+        composite = self._render_overlays(rendered, self._cached_volume, peak)
         self.set_media(image=composite)
 
-    def _render_overlays(self, icon_image: Image.Image, volume: float) -> Image.Image:
-        """Render the icon with a horizontal volume bar and vertical VU bars."""
-        img = icon_image.copy().convert("RGBA")
-        w, h = img.size
+    def _render_overlays(self, icon_image: Image.Image, volume: float, peak: float) -> Image.Image:
+        """Render the icon with a horizontal volume bar and vertical VU bar."""
+        w, h = icon_image.size
+
+        # Shrink icon to ~70% and center it, shifted up slightly
+        icon_scale = 0.70
+        icon_w = int(w * icon_scale)
+        icon_h = int(h * icon_scale)
+        scaled = icon_image.resize((icon_w, icon_h), Image.LANCZOS)
+
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ix = (w - icon_w) // 2
+        iy = max(0, (h - icon_h) // 2 - h // 10)  # nudge up for bar room
+        img.paste(scaled, (ix, iy), scaled)
+
         draw = ImageDraw.Draw(img)
-
         vol = min(1.0, max(0.0, volume))
+        pk = min(1.0, max(0.0, peak))
 
-        # --- Horizontal volume bar at bottom ---
+        pad = max(4, min(w, h) // 18)
+
+        # --- Horizontal volume bar at bottom (shows volume setting) ---
         bar_height = max(6, h // 12)
-        bar_margin = max(4, w // 14)
-        bar_y = h - bar_height - 2
+        bar_y = h - bar_height - pad
 
         # Track background
         draw.rounded_rectangle(
-            [(bar_margin, bar_y), (w - bar_margin, bar_y + bar_height)],
+            [(pad, bar_y), (w - pad, bar_y + bar_height)],
             radius=bar_height // 2,
             fill=(60, 60, 60, 200)
         )
 
         # Bar fill
-        bar_width = w - 2 * bar_margin
+        bar_width = w - 2 * pad
         fill_width = int(bar_width * vol)
         if fill_width > 0:
             if self._is_muted:
@@ -266,51 +404,41 @@ class AdjustVolume(AudioCore):
                 bar_color = (r, g, 50, 230)
 
             draw.rounded_rectangle(
-                [(bar_margin, bar_y), (bar_margin + fill_width, bar_y + bar_height)],
+                [(pad, bar_y), (pad + fill_width, bar_y + bar_height)],
                 radius=bar_height // 2,
                 fill=bar_color
             )
 
-        # --- Vertical VU bars on the right side ---
-        num_bars = 5
-        vu_bar_width = max(3, w // 25)
-        vu_gap = max(1, vu_bar_width // 3)
-        vu_right_margin = bar_margin
-        vu_total_width = num_bars * vu_bar_width + (num_bars - 1) * vu_gap
-        vu_x_start = w - vu_right_margin - vu_total_width
-
-        vu_top = max(4, h // 8)
-        vu_bottom = bar_y - 4
+        # --- Vertical VU bar on the right (shows actual audio output level) ---
+        vu_bar_width = max(4, w // 16)
+        vu_x = w - pad - vu_bar_width
+        vu_top = pad
+        vu_bottom = bar_y - pad
         vu_height = vu_bottom - vu_top
 
-        for i in range(num_bars):
-            # Each bar represents a volume threshold
-            threshold = (i + 1) / num_bars
-            bar_x = vu_x_start + i * (vu_bar_width + vu_gap)
+        # Track background
+        draw.rounded_rectangle(
+            [(vu_x, vu_top), (vu_x + vu_bar_width, vu_bottom)],
+            radius=vu_bar_width // 2,
+            fill=(60, 60, 60, 200)
+        )
 
+        # Fill proportional to peak audio level
+        fill_h = int(vu_height * pk)
+        if fill_h > 0:
             if self._is_muted:
-                # All bars dark when muted
-                fill = (60, 40, 40, 150)
-                filled_h = vu_height
-            elif vol >= threshold:
-                # Lit bar - height proportional to its threshold
-                filled_h = vu_height
-                if threshold <= 0.5:
-                    fill = (50, 200, 50, 220)   # Green
-                elif threshold <= 0.8:
-                    fill = (220, 200, 30, 220)   # Yellow
-                else:
-                    fill = (220, 50, 30, 220)    # Red
+                vu_color = (180, 40, 40, 230)
+            elif pk <= 0.5:
+                vu_color = (50, 200, 50, 220)
+            elif pk <= 0.8:
+                vu_color = (220, 200, 30, 220)
             else:
-                # Dim unlit bar
-                fill = (60, 60, 60, 100)
-                filled_h = vu_height
+                vu_color = (220, 50, 30, 220)
 
             draw.rounded_rectangle(
-                [(bar_x, vu_top + vu_height - filled_h),
-                 (bar_x + vu_bar_width, vu_bottom)],
-                radius=1,
-                fill=fill
+                [(vu_x, vu_bottom - fill_h), (vu_x + vu_bar_width, vu_bottom)],
+                radius=vu_bar_width // 2,
+                fill=vu_color
             )
 
         del draw
