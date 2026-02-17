@@ -28,12 +28,16 @@ class _PeakMonitor:
             ('channels', ctypes.c_uint8),
         ]
 
-    def __init__(self):
+    # Call on_update every N reads (~50ms each → 4 = ~200ms = 5Hz)
+    UPDATE_EVERY = 4
+
+    def __init__(self, on_update=None):
         self._lib = None
         self._peak = 0.0
         self._lock = threading.Lock()
         self._thread = None
         self._running = False
+        self._on_update = on_update
 
         try:
             self._lib = ctypes.CDLL(self._find_lib())
@@ -127,6 +131,7 @@ class _PeakMonitor:
         buf_size = 800
         buf = ctypes.create_string_buffer(buf_size)
         decay = 0.0
+        read_count = 0
 
         try:
             while self._running:
@@ -154,6 +159,15 @@ class _PeakMonitor:
 
                 with self._lock:
                     self._peak = decay
+
+                # Drive display updates at ~5Hz
+                read_count += 1
+                if self._on_update and read_count >= self.UPDATE_EVERY:
+                    read_count = 0
+                    try:
+                        self._on_update()
+                    except Exception:
+                        pass
         finally:
             self._lib.pa_simple_free(conn)
 
@@ -180,7 +194,7 @@ class AdjustVolume(AudioCore):
         self._lock = threading.Lock()
         self._vu_tick_counter = 0
 
-        self._peak_monitor = _PeakMonitor()
+        self._peak_monitor = _PeakMonitor(on_update=self.display_icon)
 
         self.create_generative_ui()
 
@@ -403,25 +417,36 @@ class AdjustVolume(AudioCore):
         """Render the icon with a horizontal volume bar and vertical VU bar."""
         w, h = icon_image.size
 
-        # Shrink icon to ~70% and center it, shifted up slightly
-        icon_scale = 0.70
-        icon_w = int(w * icon_scale)
-        icon_h = int(h * icon_scale)
-        scaled = icon_image.resize((icon_w, icon_h), Image.LANCZOS)
-
-        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        ix = (w - icon_w) // 2
-        iy = max(0, (h - icon_h) // 2 - h // 10)  # nudge up for bar room
-        img.paste(scaled, (ix, iy), scaled)
-
-        draw = ImageDraw.Draw(img)
+        draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))  # temp for measurements
         vol = min(1.0, max(0.0, volume))
         pk = min(1.0, max(0.0, peak))
 
         pad = max(4, min(w, h) // 18)
 
-        # --- Horizontal volume bar at bottom (shows volume setting) ---
+        # Pre-calculate overlay regions so we can center the icon in remaining space
         bar_height = max(6, h // 12)
+        vu_bar_width = max(4, w // 16)
+
+        # Available area for the icon: left of VU bar, above volume bar
+        icon_area_right = w - pad - vu_bar_width - pad  # stop before VU bar
+        icon_area_bottom = h - bar_height - pad - pad   # stop before vol bar
+
+        # Shrink icon to fit ~65% of the available area
+        icon_scale = 0.65
+        icon_w = int(icon_area_right * icon_scale)
+        icon_h = int(icon_area_bottom * icon_scale)
+        scaled = icon_image.resize((icon_w, icon_h), Image.LANCZOS)
+
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        # Center icon within the area left of VU and above vol bar
+        ix = (icon_area_right - icon_w) // 2
+        iy = (icon_area_bottom - icon_h) // 2
+        img.paste(scaled, (ix, iy), scaled)
+
+        del draw
+        draw = ImageDraw.Draw(img)
+
+        # --- Horizontal volume bar at bottom (shows volume setting) ---
         bar_y = h - bar_height - pad
 
         # Track background
@@ -449,9 +474,8 @@ class AdjustVolume(AudioCore):
             )
 
         # --- Vertical VU bar on the right (shows actual audio output level) ---
-        vu_bar_width = max(4, w // 16)
         vu_x = w - pad - vu_bar_width
-        vu_bottom = bar_y - pad
+        vu_bottom = bar_y - pad * 2  # extra gap above horizontal bar
         vu_top = vu_bottom - (vu_bottom - pad) * 2 // 3  # ~2/3 height
         vu_height = vu_bottom - vu_top
 
