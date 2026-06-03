@@ -1,17 +1,36 @@
 import ctypes
+import enum
 import struct
 import threading
 
 from loguru import logger as log
 from PIL import Image, ImageDraw
 
+from GtkHelper.ComboRow import SimpleComboRowItem
+from GtkHelper.GenerativeUI.ComboRow import ComboRow
 from GtkHelper.GenerativeUI.ExpanderRow import ExpanderRow
 from GtkHelper.GenerativeUI.ScaleRow import ScaleRow
+from GtkHelper.GenerativeUI.SwitchRow import SwitchRow
 from src.backend.DeckManagement.InputIdentifier import Input
 from src.backend.PluginManager.EventAssigner import EventAssigner
 from .AudioCore import AudioCore
 from ..globals import Icons
 from ..internal.PulseHelpers import get_device, change_volume, get_volumes_from_device, set_volume, mute
+
+
+class IconSource(enum.Enum):
+    """Selectable source for the center icon: dynamic (auto) or a pinned static icon."""
+    DYNAMIC = SimpleComboRowItem("dynamic", "Dynamic (auto)")
+    VOLUME_UP = SimpleComboRowItem(Icons.VOLUME_UP, "Volume Up")
+    VOLUME_DOWN = SimpleComboRowItem(Icons.VOLUME_DOWN, "Volume Down")
+    MUTED = SimpleComboRowItem(Icons.MUTED, "Muted")
+    UNMUTED = SimpleComboRowItem(Icons.UNMUTED, "Unmuted")
+    AUDIO_OFF = SimpleComboRowItem(Icons.AUDIO_OFF, "Off")
+    AUDIO_LOW = SimpleComboRowItem(Icons.AUDIO_LOW, "Low")
+    AUDIO_MEDIUM_LOW = SimpleComboRowItem(Icons.AUDIO_MEDIUM_LOW, "Medium-Low")
+    AUDIO_MEDIUM = SimpleComboRowItem(Icons.AUDIO_MEDIUM, "Medium")
+    AUDIO_HIGH = SimpleComboRowItem(Icons.AUDIO_HIGH, "High")
+    AUDIO_MAX = SimpleComboRowItem(Icons.AUDIO_MAX, "Max")
 
 
 class _PeakMonitor:
@@ -178,6 +197,12 @@ class AdjustVolume(AudioCore):
 
         self._peak_monitor = _PeakMonitor()
 
+        # Per-element icon display settings (defaults reproduce the original look)
+        self.show_icon = True
+        self.icon_source = IconSource.DYNAMIC.value
+        self.show_volume_bar = True
+        self.show_level_meter = True
+
         self.create_generative_ui()
 
     def create_generative_ui(self):
@@ -218,6 +243,56 @@ class AdjustVolume(AudioCore):
 
         self.volume_adjust_row.add_row(self.volume_adjust_scale.widget)
         self.volume_adjust_row.add_row(self.volume_bound_scale.widget)
+
+        # --- Icon Display Row: toggle each rendered element and pin a static icon ---
+        self.icon_display_row = ExpanderRow(
+            action_core=self,
+            var_name="icon-display-expander",
+            default_value=False,
+            title="Icon Display Row",
+        )
+
+        self.show_icon_switch = SwitchRow(
+            action_core=self,
+            var_name="show-icon",
+            default_value=True,
+            title="Show Icon",
+            complex_var_name=False,
+            on_change=self.on_show_icon_change
+        )
+
+        self.icon_source_combo = ComboRow(
+            action_core=self,
+            var_name="icon-source",
+            default_value=IconSource.DYNAMIC.value,
+            items=[source.value for source in IconSource],
+            title="Icon Source",
+            complex_var_name=False,
+            on_change=self.on_icon_source_change
+        )
+
+        self.show_volume_bar_switch = SwitchRow(
+            action_core=self,
+            var_name="show-volume-bar",
+            default_value=True,
+            title="Show Volume Bar",
+            complex_var_name=False,
+            on_change=self.on_show_volume_bar_change
+        )
+
+        self.show_level_meter_switch = SwitchRow(
+            action_core=self,
+            var_name="show-level-meter",
+            default_value=True,
+            title="Show Level Meter",
+            complex_var_name=False,
+            on_change=self.on_show_level_meter_change
+        )
+
+        self.icon_display_row.add_row(self.show_icon_switch.widget)
+        self.icon_display_row.add_row(self.icon_source_combo.widget)
+        self.icon_display_row.add_row(self.show_volume_bar_switch.widget)
+        self.icon_display_row.add_row(self.show_level_meter_switch.widget)
 
     def create_event_assigners(self):
         self.add_event_assigner(EventAssigner(
@@ -345,6 +420,22 @@ class AdjustVolume(AudioCore):
     def on_volume_bound_change(self, widget, value, old):
         self.bounds = value
 
+    def on_show_icon_change(self, widget, value, old):
+        self.show_icon = value
+        self.display_icon()
+
+    def on_icon_source_change(self, widget, value, old):
+        self.icon_source = value
+        self.display_icon()
+
+    def on_show_volume_bar_change(self, widget, value, old):
+        self.show_volume_bar = value
+        self.display_icon()
+
+    def on_show_level_meter_change(self, widget, value, old):
+        self.show_level_meter = value
+        self.display_icon()
+
     ########### UI STUFF ###########
 
     def set_current_icon(self):
@@ -360,11 +451,20 @@ class AdjustVolume(AudioCore):
 
         self.display_icon()
 
-    def display_icon(self):
-        with self._lock:
-            direction = self._scroll_direction
+    def _resolve_icon_asset(self, direction):
+        """Return the icon asset to display: a pinned static icon, or the dynamic choice.
 
-        # Pick icon: muted > scroll direction > idle (volume-based waves)
+        Resolved regardless of ``show_icon`` so the rendered icon's native size can
+        be used as the canvas even when the icon itself is hidden.
+        """
+        source_val = self.icon_source.get_value() if self.icon_source else "dynamic"
+        if source_val != "dynamic":
+            static_asset = self.get_icon(source_val)
+            if static_asset:
+                return static_asset
+            # Static asset missing → fall through to the dynamic selection below.
+
+        # Dynamic: muted > scroll direction > idle (volume-based waves)
         if self._is_muted:
             icon_asset = self.get_icon(Icons.MUTED)
         elif direction == "up":
@@ -386,107 +486,141 @@ class AdjustVolume(AudioCore):
 
         if not icon_asset:
             icon_asset = self.get_icon(Icons.UNMUTED)
-        if not icon_asset:
-            return
+        return icon_asset
 
-        _, rendered = icon_asset.get_values()
-        if not rendered:
-            return
+    def _reference_canvas_size(self):
+        """Canvas size to fall back on when no icon image is available (icon hidden/missing)."""
+        for key in (Icons.UNMUTED, Icons.AUDIO_OFF, Icons.MUTED):
+            asset = self.get_icon(key)
+            if asset:
+                _, rendered = asset.get_values()
+                if rendered:
+                    return rendered.size
+        return (512, 512)
+
+    def display_icon(self):
+        with self._lock:
+            direction = self._scroll_direction
+
+        icon_asset = self._resolve_icon_asset(direction)
+
+        rendered = None
+        if icon_asset is not None:
+            _, rendered = icon_asset.get_values()
 
         peak = self._peak_monitor.peak if self._peak_monitor.available else 0.0
         composite = self._render_overlays(rendered, self._cached_volume, peak)
-        self.set_media(image=composite)
+        if composite is not None:
+            self.set_media(image=composite)
 
-    def _render_overlays(self, icon_image: Image.Image, volume: float, peak: float) -> Image.Image:
-        """Render the icon with a horizontal volume bar and vertical VU bar."""
-        w, h = icon_image.size
+    def _render_overlays(self, icon_image, volume: float, peak: float) -> Image.Image:
+        """Composite the enabled elements (icon, volume bar, level meter) onto a key image.
 
-        draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))  # temp for measurements
+        Each element is toggled by ``show_icon`` / ``show_volume_bar`` / ``show_level_meter``.
+        Hidden elements free their reserved space and the remaining elements reflow to fill it.
+        """
+        show_icon = self.show_icon and icon_image is not None
+        show_volume_bar = self.show_volume_bar
+        show_level_meter = self.show_level_meter
+
+        # Canvas size: match the icon's native resolution, or fall back when hidden/missing.
+        if icon_image is not None:
+            w, h = icon_image.size
+        else:
+            w, h = self._reference_canvas_size()
+
         vol = min(1.0, max(0.0, volume))
         pk = min(1.0, max(0.0, peak))
 
         pad = max(4, min(w, h) // 18)
 
-        # Pre-calculate overlay regions so we can center the icon in remaining space
-        bar_height = max(6, h // 12)
-        vu_bar_width = max(4, w // 16)
+        # Space reserved for each bar; zero when that bar is hidden so the icon can reflow into it.
+        bar_height = max(6, h // 12) if show_volume_bar else 0
+        vu_bar_width = max(4, w // 16) if show_level_meter else 0
 
-        # Available area for the icon: left of VU bar, above volume bar
-        icon_area_right = w - pad - vu_bar_width - pad  # stop before VU bar
-        icon_area_bottom = h - bar_height - pad - pad   # stop before vol bar
-
-        # Shrink icon to fit ~65% of the available area
-        icon_scale = 0.65
-        icon_w = int(icon_area_right * icon_scale)
-        icon_h = int(icon_area_bottom * icon_scale)
-        scaled = icon_image.resize((icon_w, icon_h), Image.LANCZOS)
+        # Available area for the icon: left of the level meter, above the volume bar.
+        if show_level_meter:
+            icon_area_right = w - pad - vu_bar_width - pad  # stop before level meter
+        else:
+            icon_area_right = w - pad
+        if show_volume_bar:
+            icon_area_bottom = h - bar_height - pad - pad   # stop before volume bar
+        else:
+            icon_area_bottom = h - pad
 
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        # Center icon within the area left of VU and above vol bar, nudged down
-        ix = (icon_area_right - icon_w) // 2 + pad
-        iy = (icon_area_bottom - icon_h) // 2 + pad * 2
-        img.paste(scaled, (ix, iy), scaled)
 
-        del draw
+        if show_icon:
+            # Shrink icon to ~65% of the available area, then center it (nudged down).
+            icon_scale = 0.65
+            icon_w = max(1, int(icon_area_right * icon_scale))
+            icon_h = max(1, int(icon_area_bottom * icon_scale))
+            scaled = icon_image.resize((icon_w, icon_h), Image.LANCZOS)
+            ix = (icon_area_right - icon_w) // 2 + pad
+            iy = (icon_area_bottom - icon_h) // 2 + pad * 2
+            img.paste(scaled, (ix, iy), scaled)
+
         draw = ImageDraw.Draw(img)
 
         # --- Horizontal volume bar at bottom (shows volume setting) ---
         bar_y = h - bar_height - pad
-
-        # Track background
-        draw.rounded_rectangle(
-            [(pad, bar_y), (w - pad, bar_y + bar_height)],
-            radius=bar_height // 2,
-            fill=(60, 60, 60, 200)
-        )
-
-        # Bar fill
-        bar_width = w - 2 * pad
-        fill_width = int(bar_width * vol)
-        if fill_width > 0:
-            if self._is_muted:
-                bar_color = (180, 40, 40, 230)
-            else:
-                r = min(255, int(vol * 2 * 255))
-                g = min(255, int((1 - vol * 0.5) * 255))
-                bar_color = (r, g, 50, 230)
-
+        if show_volume_bar:
+            # Track background
             draw.rounded_rectangle(
-                [(pad, bar_y), (pad + fill_width, bar_y + bar_height)],
+                [(pad, bar_y), (w - pad, bar_y + bar_height)],
                 radius=bar_height // 2,
-                fill=bar_color
+                fill=(60, 60, 60, 200)
             )
 
-        # --- Vertical VU bar on the right (shows actual audio output level) ---
-        vu_x = w - pad - vu_bar_width
-        vu_bottom = bar_y - pad * 2  # extra gap above horizontal bar
-        vu_top = vu_bottom - (vu_bottom - pad) * 2 // 3  # ~2/3 height
-        vu_height = vu_bottom - vu_top
+            # Bar fill
+            bar_width = w - 2 * pad
+            fill_width = int(bar_width * vol)
+            if fill_width > 0:
+                if self._is_muted:
+                    bar_color = (180, 40, 40, 230)
+                else:
+                    r = min(255, int(vol * 2 * 255))
+                    g = min(255, int((1 - vol * 0.5) * 255))
+                    bar_color = (r, g, 50, 230)
 
-        # Track background
-        draw.rounded_rectangle(
-            [(vu_x, vu_top), (vu_x + vu_bar_width, vu_bottom)],
-            radius=vu_bar_width // 2,
-            fill=(60, 60, 60, 200)
-        )
+                draw.rounded_rectangle(
+                    [(pad, bar_y), (pad + fill_width, bar_y + bar_height)],
+                    radius=bar_height // 2,
+                    fill=bar_color
+                )
 
-        # Fill proportional to peak audio level
-        fill_h = int(vu_height * pk)
-        if fill_h > 0:
-            if self._is_muted:
-                vu_color = (180, 40, 40, 230)
-            elif pk <= 0.5:
-                vu_color = (50, 200, 50, 220)
-            elif pk <= 0.8:
-                vu_color = (220, 200, 30, 220)
-            else:
-                vu_color = (220, 50, 30, 220)
+        # --- Vertical level meter on the right (shows actual audio output level) ---
+        if show_level_meter:
+            vu_x = w - pad - vu_bar_width
+            # Extend to just above the volume bar, or to the bottom pad when it's hidden.
+            vu_bottom = (bar_y - pad * 2) if show_volume_bar else (h - pad)
+            vu_top = vu_bottom - (vu_bottom - pad) * 2 // 3  # ~2/3 height
+            vu_height = vu_bottom - vu_top
 
+            # Track background
             draw.rounded_rectangle(
-                [(vu_x, vu_bottom - fill_h), (vu_x + vu_bar_width, vu_bottom)],
+                [(vu_x, vu_top), (vu_x + vu_bar_width, vu_bottom)],
                 radius=vu_bar_width // 2,
-                fill=vu_color
+                fill=(60, 60, 60, 200)
             )
+
+            # Fill proportional to peak audio level
+            fill_h = int(vu_height * pk)
+            if fill_h > 0:
+                if self._is_muted:
+                    vu_color = (180, 40, 40, 230)
+                elif pk <= 0.5:
+                    vu_color = (50, 200, 50, 220)
+                elif pk <= 0.8:
+                    vu_color = (220, 200, 30, 220)
+                else:
+                    vu_color = (220, 50, 30, 220)
+
+                draw.rounded_rectangle(
+                    [(vu_x, vu_bottom - fill_h), (vu_x + vu_bar_width, vu_bottom)],
+                    radius=vu_bar_width // 2,
+                    fill=vu_color
+                )
 
         del draw
         return img
