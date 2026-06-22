@@ -385,13 +385,19 @@ class AdjustVolume(AudioCore):
             self.show_error(1)
 
     def _refresh_cached_volume(self):
-        """Query PulseAudio once and cache the result."""
+        """Query PulseAudio once and cache volume + mute state.
+
+        Reads both from a single device lookup so the mute state stays current
+        every tick (catches mutes made outside this action), which the level
+        meter relies on to stop animating when muted.
+        """
         if self.selected_device is None:
             return
         try:
-            volumes = get_volumes_from_device(self.device_filter, self.selected_device.pulse_name)
-            if volumes:
-                self._cached_volume = volumes[0] / 100.0
+            device = get_device(self.device_filter, self.selected_device.pulse_name)
+            if device is not None:
+                self._cached_volume = device.volume.value_flat
+                self._is_muted = bool(device.mute)
         except Exception:
             pass
 
@@ -508,7 +514,12 @@ class AdjustVolume(AudioCore):
         if icon_asset is not None:
             _, rendered = icon_asset.get_values()
 
-        peak = self._peak_monitor.peak if self._peak_monitor.available else 0.0
+        # A muted device reads as silent: don't animate the level meter off the
+        # monitor source, which still carries the (now-inaudible) signal.
+        if self._is_muted:
+            peak = 0.0
+        else:
+            peak = self._peak_monitor.peak if self._peak_monitor.available else 0.0
         composite = self._render_overlays(rendered, self._cached_volume, peak)
         if composite is not None:
             self.set_media(image=composite)
